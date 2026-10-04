@@ -28,7 +28,6 @@ pub struct Con {
     screen: Screen,
     keymap: KeyMap<Keycode>,
     modifiers: [Vec<Keycode>; 8],
-    delay: u32, // milliseconds
 }
 
 impl From<ConnectionError> for NewConError {
@@ -83,6 +82,7 @@ impl Con {
             unused_keycodes,
             keysyms_per_keycode,
             keysyms,
+            delay,
         );
 
         // Get the keycodes of the modifiers
@@ -93,19 +93,46 @@ impl Con {
             screen,
             keymap,
             modifiers,
-            delay,
         })
+    }
+
+    fn shifted_click(&mut self, keycode: Keycode) -> InputResult<()> {
+        let keys = self
+            .connection
+            .query_keymap()
+            .map_err(|_| InputError::Simulate("could not query held modifiers"))?
+            .reply()
+            .map_err(|_| InputError::Simulate("could not read held modifiers"))?
+            .keys;
+        let shift_held = self.modifiers[0]
+            .iter()
+            .any(|code| keys[usize::from(*code) / 8] & (1 << (*code % 8)) != 0);
+        if shift_held {
+            return self.raw(keycode.into(), Direction::Click);
+        }
+        let shift = self.modifiers[0]
+            .first()
+            .copied()
+            .ok_or_else(|| InputError::Mapping("no Shift key is mapped".into()))?;
+        if let Err(error) = self.raw(shift.into(), Direction::Press) {
+            let _ = self.raw(shift.into(), Direction::Release);
+            return Err(error);
+        }
+        let clicked = self.raw(keycode.into(), Direction::Click);
+        // Only release the modifier acquired by this call, including on error.
+        let released = self.raw(shift.into(), Direction::Release);
+        clicked.and(released)
     }
 
     /// Get the delay per keypress in milliseconds
     #[must_use]
     pub fn delay(&self) -> u32 {
-        self.delay
+        self.keymap.delay()
     }
 
     /// Set the delay in milliseconds per keypress
     pub fn set_delay(&mut self, delay: u32) {
-        self.delay = delay;
+        self.keymap.set_delay(delay);
     }
 
     /// Find keycodes that have not yet been mapped any keysyms
@@ -253,6 +280,11 @@ impl Keyboard for Con {
     }
 
     fn key(&mut self, key: Key, direction: Direction) -> InputResult<()> {
+        if direction == Direction::Click && matches!(key, Key::Unicode(_)) {
+            if let Some(keycode) = self.keymap.shifted_keycode(key) {
+                return self.shifted_click(keycode);
+            }
+        }
         let keycode = self.keymap.key_to_keycode(&self.connection, key)?;
 
         if log::log_enabled!(log::Level::Debug) {
@@ -272,7 +304,7 @@ impl Keyboard for Con {
                 "Keycode was too large. It has to fit in u8 on X11",
             ));
         };
-        let time = self.keymap.pending_delays();
+        let time = self.keymap.delay_for(keycode, std::time::Instant::now());
         let root = self.screen.root;
         let root_x = 0;
         let root_y = 0;
@@ -297,16 +329,12 @@ impl Keyboard for Con {
             trace!("press");
         }
 
-        // TODO: Check if we need to update the delays again
-        // self.keymap.update_delays(keycode);
-        // let time = self.keymap.pending_delays();
-
         if direction == Direction::Release || direction == Direction::Click {
             self.connection
                 .xtest_fake_input(
                     x11rb::protocol::xproto::KEY_RELEASE_EVENT,
                     keycode,
-                    time, // TODO: Check if there needs to be a delay here
+                    time,
                     root,
                     root_x,
                     root_y,
@@ -346,7 +374,7 @@ impl Mouse for Con {
             Button::Back => 8,
             Button::Forward => 9,
         };
-        let time = self.delay;
+        let time = self.delay();
         let root = self.screen.root;
         let root_x = 0;
         let root_y = 0;
@@ -489,5 +517,37 @@ impl Mouse for Con {
                 InputError::Simulate("error with the reply of query_pointer with x11rb: {e:?}")
             })?;
         Ok((reply.root_x as i32, reply.root_y as i32))
+    }
+}
+
+#[cfg(test)]
+mod shifted_click_tests {
+    use super::Con;
+    use crate::{Direction, Key, Keyboard};
+    use x11rb::protocol::xproto::ConnectionExt;
+
+    #[test]
+    #[ignore = "requires an explicitly supplied scratch ENIGO_TEST_DISPLAY"]
+    fn unicode_click_keeps_another_clients_shift_held() {
+        let display = std::env::var("ENIGO_TEST_DISPLAY").expect("scratch display required");
+        let mut holder = Con::new(Some(&display), 0).unwrap();
+        let mut output = Con::new(Some(&display), 25).unwrap();
+        assert_eq!(output.delay(), 25);
+        output.set_delay(0);
+        assert_eq!(output.delay(), 0);
+        let shift = holder.modifiers[0][0];
+        holder.raw(shift.into(), Direction::Press).unwrap();
+        let clicked = output.key(Key::Unicode('A'), Direction::Click);
+        let keys = output
+            .connection
+            .query_keymap()
+            .unwrap()
+            .reply()
+            .unwrap()
+            .keys;
+        holder.raw(shift.into(), Direction::Release).unwrap();
+        clicked.unwrap();
+        assert_ne!(keys[usize::from(shift) / 8] & (1 << (shift % 8)), 0);
+        assert!(output.keymap.keymap_mapping.additionally_mapped.is_empty());
     }
 }

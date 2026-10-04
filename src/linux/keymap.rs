@@ -7,9 +7,6 @@ pub(super) use xkeysym::{KeyCode, Keysym};
 
 use crate::{Direction, InputError, InputResult, Key};
 
-#[cfg(feature = "x11rb")]
-const DEFAULT_DELAY: u32 = 12;
-
 #[derive(Debug)]
 pub(super) struct KeyMapMapping<Keycode> {
     pub(super) additionally_mapped: HashMap<Keysym, Keycode>,
@@ -37,8 +34,6 @@ pub struct KeyMap<Keycode> {
     delay: u32, // milliseconds
     #[cfg(feature = "x11rb")]
     last_event_before_delays: std::time::Instant, // time of the last event
-    #[cfg(feature = "x11rb")]
-    pending_delays: u32,
 }
 
 impl<Keycode> KeyMap<Keycode>
@@ -55,6 +50,7 @@ where
         unused_keycodes: VecDeque<Keycode>,
         keysyms_per_keycode: u8,
         keysyms: Vec<u32>,
+        #[cfg(feature = "x11rb")] delay: u32,
     ) -> Self {
         let capacity: usize = keycode_max.try_into().unwrap() - keycode_min.try_into().unwrap();
         let capacity = capacity + 1;
@@ -77,11 +73,7 @@ where
         };
 
         #[cfg(feature = "x11rb")]
-        let delay = DEFAULT_DELAY;
-        #[cfg(feature = "x11rb")]
         let last_event_before_delays = std::time::Instant::now();
-        #[cfg(feature = "x11rb")]
-        let pending_delays = 0;
 
         Self {
             keymap_mapping,
@@ -90,40 +82,40 @@ where
             delay,
             #[cfg(feature = "x11rb")]
             last_event_before_delays,
-            #[cfg(feature = "x11rb")]
-            pending_delays,
         }
     }
 
-    fn keysym_to_keycode(&self, keysym: Keysym) -> Option<Keycode> {
+    fn keysym_to_keycode(&self, keysym: Keysym, level: u8) -> Option<Keycode> {
         let keycode_min: usize = self.keymap_mapping.keycode_min.try_into().unwrap();
         let keycode_max: usize = self.keymap_mapping.keycode_max.try_into().unwrap();
-
-        // TODO: Change this range to 0..self.keysyms_per_keycode once we find out how
-        // to detect the level and switch it
-        for j in 0..1 {
-            for i in keycode_min..=keycode_max {
-                let i: u32 = i.try_into().unwrap();
-                let min_keycode: u32 = keycode_min.try_into().unwrap();
-                let keycode = KeyCode::from(i);
-                let min_keycode = KeyCode::from(min_keycode);
-                if let Some(ks) = xkeysym::keysym(
-                    keycode,
-                    j,
-                    min_keycode,
-                    self.keymap_mapping.keysyms_per_keycode,
-                    &self.keymap_mapping.keysyms,
-                ) {
-                    if ks == keysym {
-                        let i: usize = i.try_into().unwrap();
-                        let i: Keycode = i.try_into().unwrap();
-                        trace!("found keysym in row {i}, col {j}");
-                        return Some(i);
-                    }
-                }
+        for i in keycode_min..=keycode_max {
+            let raw_code: u32 = i.try_into().unwrap();
+            let min_code: u32 = keycode_min.try_into().unwrap();
+            if xkeysym::keysym(
+                KeyCode::from(raw_code),
+                level,
+                KeyCode::from(min_code),
+                self.keymap_mapping.keysyms_per_keycode,
+                &self.keymap_mapping.keysyms,
+            ) == Some(keysym)
+            {
+                trace!("found keysym in row {i}, col {level}");
+                return Some(i.try_into().unwrap());
             }
         }
         None
+    }
+
+    // Clicks can own Shift just for the text event. Held Unicode keys still
+    // need layer-independent mappings so unrelated held keys are unaffected.
+    #[cfg(feature = "x11rb")]
+    pub fn shifted_keycode(&self, key: Key) -> Option<Keycode> {
+        let sym = Keysym::from(key);
+        if self.keysym_to_keycode(sym, 0).is_some() {
+            None
+        } else {
+            self.keysym_to_keycode(sym, 1)
+        }
     }
 
     // Try to enter the key
@@ -131,7 +123,7 @@ where
     pub fn key_to_keycode<C: Bind<Keycode>>(&mut self, c: &C, key: Key) -> InputResult<Keycode> {
         let sym = Keysym::from(key);
 
-        if let Some(keycode) = self.keysym_to_keycode(sym) {
+        if let Some(keycode) = self.keysym_to_keycode(sym, 0) {
             return Ok(keycode);
         }
 
@@ -148,15 +140,17 @@ where
             }
         };
 
-        #[cfg(feature = "x11rb")]
-        self.update_delays(keycode);
         Ok(keycode)
     }
 
-    /// Get the pending delay
     #[cfg(feature = "x11rb")]
-    pub fn pending_delays(&self) -> u32 {
-        self.pending_delays
+    pub fn delay(&self) -> u32 {
+        self.delay
+    }
+
+    #[cfg(feature = "x11rb")]
+    pub fn set_delay(&mut self, delay: u32) {
+        self.delay = delay;
     }
 
     /// Add the Keysym to the keymap
@@ -202,11 +196,9 @@ where
         Ok(())
     }
 
-    // Update the delay
-    // TODO: A delay of 1 ms in all cases seems to work on my machine. Maybe
-    // this is not needed?
+    // Compute the delay for this event, including keys with existing mappings.
     #[cfg(feature = "x11rb")]
-    pub fn update_delays(&mut self, keycode: Keycode) {
+    pub fn delay_for(&mut self, keycode: Keycode, now: std::time::Instant) -> u32 {
         // Check if a delay is needed
         // A delay is required, if one of the keycodes was recently entered and there
         // was no delay between it
@@ -216,21 +208,21 @@ where
         // Chunk 2: ' rab'     # Add a delay before the second 'b'
         // Chunk 3: 'bit'     # Enter the remaining chars
 
-        if self.keymap_state.last_keys.contains(&keycode) {
-            let elapsed_ms = self
-                .last_event_before_delays
-                .elapsed()
+        let delay = if self.keymap_state.last_keys.contains(&keycode) {
+            let elapsed_ms = now
+                .saturating_duration_since(self.last_event_before_delays)
                 .as_millis()
                 .try_into()
                 .unwrap_or(u32::MAX);
-            self.pending_delays = self.delay.saturating_sub(elapsed_ms);
             trace!("delay needed");
             self.keymap_state.last_keys.clear();
+            self.delay.saturating_sub(elapsed_ms)
         } else {
-            trace!("no delay needed");
-            self.pending_delays = 1;
-        }
+            trace!("no repeated-key delay needed");
+            self.delay.min(1)
+        };
         self.keymap_state.last_keys.push(keycode);
+        delay
     }
 
     /// Check if there are still unused keycodes available. If there aren't,
@@ -291,3 +283,95 @@ pub trait Bind<Keycode> {
 }
 
 impl<Keycode> Bind<Keycode> for () {}
+
+#[cfg(all(test, feature = "x11rb"))]
+mod delay_tests {
+    use super::KeyMap;
+    use std::{
+        collections::VecDeque,
+        time::{Duration, Instant},
+    };
+
+    fn keymap(delay: u32, now: Instant) -> KeyMap<u8> {
+        let mut keymap = KeyMap::new(8, 9, VecDeque::new(), 1, vec![0, 0], delay);
+        keymap.last_event_before_delays = now;
+        keymap
+    }
+
+    #[test]
+    fn zero_delay_applies_to_new_and_repeated_keys() {
+        let now = Instant::now();
+        let mut keymap = keymap(0, now);
+        for keycode in [8, 9, 8, 8, 9] {
+            assert_eq!(keymap.delay_for(keycode, now), 0);
+        }
+    }
+
+    #[test]
+    fn repeated_keys_use_configured_delay_minus_elapsed_time() {
+        let now = Instant::now();
+        let mut keymap = keymap(17, now);
+        assert_eq!(keymap.delay_for(8, now), 1);
+        assert_eq!(keymap.delay_for(8, now + Duration::from_millis(7)), 10);
+        assert_eq!(keymap.delay_for(8, now + Duration::from_millis(18)), 0);
+    }
+
+    #[test]
+    fn a_repeated_key_delay_is_not_reused_for_the_next_distinct_key() {
+        let now = Instant::now();
+        let mut keymap = keymap(17, now);
+        assert_eq!(keymap.delay_for(8, now), 1);
+        assert_eq!(keymap.delay_for(8, now), 17);
+        assert_eq!(keymap.delay_for(9, now), 1);
+    }
+
+    #[test]
+    fn constructor_and_setter_share_the_authoritative_delay() {
+        let now = Instant::now();
+        let mut constructed = keymap(25, now);
+        let mut updated = keymap(12, now);
+        updated.set_delay(25);
+        assert_eq!(constructed.delay(), updated.delay());
+        for keycode in [8, 9, 8, 8] {
+            assert_eq!(
+                constructed.delay_for(keycode, now),
+                updated.delay_for(keycode, now)
+            );
+        }
+        updated.set_delay(0);
+        assert_eq!(updated.delay(), 0);
+        assert_eq!(updated.delay_for(8, now), 0);
+        updated.set_delay(9);
+        assert_eq!(updated.delay_for(8, now), 9);
+    }
+}
+
+#[cfg(all(test, feature = "x11rb"))]
+mod shifted_mapping_tests {
+    use super::{KeyMap, Keysym};
+    use crate::Key;
+    use std::collections::VecDeque;
+
+    #[test]
+    fn shifted_letters_and_symbols_use_existing_level_one() {
+        let keymap = KeyMap::new(
+            8_u8,
+            9,
+            VecDeque::new(),
+            2,
+            vec![
+                Keysym::a.raw(),
+                Keysym::A.raw(),
+                Keysym::_1.raw(),
+                Keysym::exclam.raw(),
+            ],
+            0,
+        );
+        assert_eq!(keymap.shifted_keycode(Key::Unicode('A')), Some(8));
+        assert_eq!(keymap.shifted_keycode(Key::Unicode('!')), Some(9));
+        assert_eq!(keymap.shifted_keycode(Key::Unicode('a')), None);
+        assert_eq!(keymap.shifted_keycode(Key::Unicode('1')), None);
+        assert_eq!(keymap.shifted_keycode(Key::Unicode('é')), None);
+        assert!(keymap.keymap_mapping.additionally_mapped.is_empty());
+    }
+}
