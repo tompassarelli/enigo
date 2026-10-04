@@ -135,6 +135,66 @@ impl Con {
         self.keymap.set_delay(delay);
     }
 
+    pub fn text_to_window(&mut self, text: &str, window: u32) -> InputResult<()> {
+        use x11rb::protocol::xproto::{
+            EventMask, KEY_PRESS_EVENT, KEY_RELEASE_EVENT, KeyButMask, KeyPressEvent,
+        };
+
+        // XSendEvent reserves 0 and 1 for focus-dependent destinations.
+        if window <= 1 {
+            return Err(InputError::InvalidInput(
+                "an explicit X11 window is required",
+            ));
+        }
+        self.connection
+            .get_window_attributes(window)
+            .map_err(|_| InputError::Simulate("could not query target window"))?
+            .reply()
+            .map_err(|_| InputError::Simulate("target window does not exist"))?;
+        for character in text.chars() {
+            let key = Key::Unicode(character);
+            let (detail, state) = if let Some(code) = self.keymap.shifted_keycode(key) {
+                (code, KeyButMask::SHIFT)
+            } else {
+                (
+                    self.keymap.key_to_keycode(&self.connection, key)?,
+                    KeyButMask::default(),
+                )
+            };
+            for response_type in [KEY_PRESS_EVENT, KEY_RELEASE_EVENT] {
+                let event = KeyPressEvent {
+                    response_type,
+                    detail,
+                    sequence: 0,
+                    time: x11rb::CURRENT_TIME,
+                    root: self.screen.root,
+                    event: window,
+                    child: x11rb::NONE,
+                    root_x: 0,
+                    root_y: 0,
+                    event_x: 0,
+                    event_y: 0,
+                    state,
+                    same_screen: true,
+                };
+                self.connection
+                    .send_event(
+                        false,
+                        window,
+                        EventMask::KEY_PRESS | EventMask::KEY_RELEASE,
+                        event,
+                    )
+                    .map_err(|_| InputError::Simulate("could not send window text event"))?
+                    .check()
+                    .map_err(|_| InputError::Simulate("window text event was rejected"))?;
+            }
+            if self.delay() > 0 {
+                std::thread::sleep(std::time::Duration::from_millis(self.delay().into()));
+            }
+        }
+        Ok(())
+    }
+
     /// Find keycodes that have not yet been mapped any keysyms
     fn get_keyboard_mapping(
         connection: &CompositorConnection,
@@ -549,5 +609,112 @@ mod shifted_click_tests {
         clicked.unwrap();
         assert_ne!(keys[usize::from(shift) / 8] & (1 << (shift % 8)), 0);
         assert!(output.keymap.keymap_mapping.additionally_mapped.is_empty());
+    }
+
+    #[test]
+    #[ignore = "requires an explicitly supplied scratch ENIGO_TEST_DISPLAY"]
+    fn directed_text_preserves_recipient_and_case_across_focus_changes() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+        use x11rb::{
+            connection::Connection,
+            protocol::{
+                Event,
+                xproto::{CreateWindowAux, EventMask, InputFocus, KeyButMask, WindowClass},
+            },
+            wrapper::ConnectionExt as _,
+        };
+        let display = std::env::var("ENIGO_TEST_DISPLAY").expect("scratch display required");
+        let (receiver, screen) = x11rb::connect(Some(&display)).unwrap();
+        let root = receiver.setup().roots[screen].root;
+        let mut windows = Vec::new();
+        for x in [0, 240] {
+            let window = receiver.generate_id().unwrap();
+            receiver
+                .create_window(
+                    x11rb::COPY_DEPTH_FROM_PARENT,
+                    window,
+                    root,
+                    x,
+                    0,
+                    200,
+                    100,
+                    0,
+                    WindowClass::INPUT_OUTPUT,
+                    0,
+                    &CreateWindowAux::new()
+                        .override_redirect(1)
+                        .event_mask(EventMask::KEY_PRESS | EventMask::KEY_RELEASE),
+                )
+                .unwrap()
+                .check()
+                .unwrap();
+            receiver.map_window(window).unwrap().check().unwrap();
+            windows.push(window);
+        }
+        let mut output = Con::new(Some(&display), 0).unwrap();
+        let before = receiver.query_keymap().unwrap().reply().unwrap().keys;
+        let running = Arc::new(AtomicBool::new(true));
+        let active = running.clone();
+        let focus_display = display.clone();
+        let target = windows[0];
+        let other = windows[1];
+        receiver
+            .set_input_focus(InputFocus::PARENT, other, x11rb::CURRENT_TIME)
+            .unwrap()
+            .check()
+            .unwrap();
+        let focus = std::thread::spawn(move || {
+            let (connection, _) = x11rb::connect(Some(&focus_display)).unwrap();
+            while active.load(Ordering::Relaxed) {
+                for window in [target, other] {
+                    connection
+                        .set_input_focus(InputFocus::PARENT, window, x11rb::CURRENT_TIME)
+                        .unwrap()
+                        .check()
+                        .unwrap();
+                }
+            }
+        });
+        let expected = "aAzZ09_-=;".repeat(32);
+        let sent = output.text_to_window(&expected, target);
+        running.store(false, Ordering::Relaxed);
+        focus.join().unwrap();
+        sent.unwrap();
+        receiver.sync().unwrap();
+        let mut actual = String::new();
+        let mut releases = 0;
+        while let Some(event) = receiver.poll_for_event().unwrap() {
+            match event {
+                Event::KeyPress(key) => {
+                    assert_eq!(key.event, target, "text leaked to the other window");
+                    let mapping = receiver
+                        .get_keyboard_mapping(key.detail, 1)
+                        .unwrap()
+                        .reply()
+                        .unwrap();
+                    let level = usize::from(key.state.contains(KeyButMask::SHIFT));
+                    actual.push(char::from_u32(mapping.keysyms[level]).unwrap());
+                }
+                Event::KeyRelease(key) => {
+                    assert_eq!(key.event, target, "release leaked to the other window");
+                    releases += 1;
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(actual, expected);
+        assert_eq!(releases, expected.len());
+        assert_eq!(
+            receiver.query_keymap().unwrap().reply().unwrap().keys,
+            before
+        );
+        assert!(output.text_to_window("x", 1).is_err());
+        for window in windows {
+            receiver.destroy_window(window).unwrap().check().unwrap();
+        }
+        assert!(output.text_to_window("x", target).is_err());
     }
 }

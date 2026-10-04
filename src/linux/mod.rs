@@ -50,6 +50,22 @@ pub struct Enigo {
 }
 
 impl Enigo {
+    /// Send text events directly to one X11 window, without changing focus or
+    /// the server's held keys. The receiving application must accept XSendEvent.
+    /// Success means that the X server accepted the events, not that the
+    /// application consumed them. An error can follow partial delivery.
+    ///
+    /// # Errors
+    /// Returns an error without an x11rb connection, for a special/nonexistent
+    /// window, or when key mapping or event delivery fails.
+    #[cfg(feature = "x11rb")]
+    pub fn text_to_window(&mut self, text: &str, window: u32) -> InputResult<()> {
+        self.x11
+            .as_mut()
+            .ok_or(InputError::Simulate("no X11 connection"))?
+            .text_to_window(text, window)
+    }
+
     /// Create a new Enigo struct to establish the connection to simulate input
     /// with the specified settings
     ///
