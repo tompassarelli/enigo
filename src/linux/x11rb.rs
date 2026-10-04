@@ -161,7 +161,7 @@ impl Con {
                     KeyButMask::default(),
                 )
             };
-            for response_type in [KEY_PRESS_EVENT, KEY_RELEASE_EVENT] {
+            let send = |detail, state, response_type| {
                 let event = KeyPressEvent {
                     response_type,
                     detail,
@@ -186,8 +186,32 @@ impl Con {
                     )
                     .map_err(|_| InputError::Simulate("could not send window text event"))?
                     .check()
-                    .map_err(|_| InputError::Simulate("window text event was rejected"))?;
+                    .map_err(|_| InputError::Simulate("window text event was rejected"))
+            };
+            let shift = if state.contains(KeyButMask::SHIFT) {
+                Some(
+                    *self.modifiers[0]
+                        .first()
+                        .ok_or_else(|| InputError::Mapping("no Shift key is mapped".into()))?,
+                )
+            } else {
+                None
+            };
+            // Clients such as Wine track modifiers from key events rather
+            // than using only the modifier mask on a text key's event.
+            if let Some(shift) = shift {
+                if let Err(error) = send(shift, KeyButMask::default(), KEY_PRESS_EVENT) {
+                    let _ = send(shift, state, KEY_RELEASE_EVENT);
+                    return Err(error);
+                }
             }
+            let result = send(detail, state, KEY_PRESS_EVENT)
+                .and_then(|()| send(detail, state, KEY_RELEASE_EVENT));
+            let released = match shift {
+                Some(shift) => send(shift, state, KEY_RELEASE_EVENT),
+                None => Ok(()),
+            };
+            result.and(released)?;
             if self.delay() > 0 {
                 std::thread::sleep(std::time::Duration::from_millis(self.delay().into()));
             }
@@ -686,20 +710,37 @@ mod shifted_click_tests {
         receiver.sync().unwrap();
         let mut actual = String::new();
         let mut releases = 0;
+        let shift = output.modifiers[0][0];
+        let mut shift_down = false;
+        let mut shift_presses = 0;
+        let mut shift_releases = 0;
         while let Some(event) = receiver.poll_for_event().unwrap() {
             match event {
                 Event::KeyPress(key) => {
                     assert_eq!(key.event, target, "text leaked to the other window");
+                    if key.detail == shift {
+                        assert!(!shift_down);
+                        shift_down = true;
+                        shift_presses += 1;
+                        continue;
+                    }
                     let mapping = receiver
                         .get_keyboard_mapping(key.detail, 1)
                         .unwrap()
                         .reply()
                         .unwrap();
-                    let level = usize::from(key.state.contains(KeyButMask::SHIFT));
+                    assert_eq!(key.state.contains(KeyButMask::SHIFT), shift_down);
+                    let level = usize::from(shift_down);
                     actual.push(char::from_u32(mapping.keysyms[level]).unwrap());
                 }
                 Event::KeyRelease(key) => {
                     assert_eq!(key.event, target, "release leaked to the other window");
+                    if key.detail == shift {
+                        assert!(shift_down);
+                        shift_down = false;
+                        shift_releases += 1;
+                        continue;
+                    }
                     releases += 1;
                 }
                 _ => {}
@@ -707,6 +748,9 @@ mod shifted_click_tests {
         }
         assert_eq!(actual, expected);
         assert_eq!(releases, expected.len());
+        assert_eq!(shift_presses, 96);
+        assert_eq!(shift_releases, shift_presses);
+        assert!(!shift_down);
         assert_eq!(
             receiver.query_keymap().unwrap().reply().unwrap().keys,
             before
