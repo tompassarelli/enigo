@@ -1,0 +1,4 @@
+[land]
+	inferred = false
+	check = src/,examples/,tests/,Cargo.toml :: command -v cargo >/dev/null || exit 75; cargo clippy --all-targets --offline -- -D warnings
+	check = src/,examples/,tests/,Cargo.toml :: command -v cargo >/dev/null || exit 75; cargo test --offline
